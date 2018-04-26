@@ -13,6 +13,7 @@ try:
 except ImportError:
     from inspect import isasyncgenfunction
 
+tasks = []
 
 def _is_coroutine(obj):
     """Check to see if an object is really an asyncio coroutine."""
@@ -30,11 +31,16 @@ def pytest_configure(config):
                             "mark the test as a coroutine, it will be "
                             "run using an asyncio event loop with a process "
                             "pool")
+    config.addinivalue_line("markers",
+                            "asyncio_testrun: "
+                            "mark the test as a coroutine, all tests will be "
+                            "run using a single asyncio event loop")
 
 
 @pytest.mark.tryfirst
 def pytest_pycollect_makeitem(collector, name, obj):
     """A pytest hook to collect asyncio coroutines."""
+    # a = collector.collect()
     if collector.funcnamefilter(name) and _is_coroutine(obj):
         item = pytest.Function(name, parent=collector)
 
@@ -47,6 +53,11 @@ def pytest_pycollect_makeitem(collector, name, obj):
         if ('asyncio' in item.keywords or
             'asyncio_process_pool' in item.keywords):
             return list(collector._genfunctions(name, obj))
+        elif 'asyncio_testrun' in item.keywords:
+            global tasks
+            tasks.append(item)
+            return list(collector._genfunctions(name, obj))
+
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -149,14 +160,55 @@ def pytest_pyfunc_call(pyfuncitem):
         if marker_name in pyfuncitem.keywords:
             event_loop = pyfuncitem.funcargs[fixture_name]
 
-            funcargs = pyfuncitem.funcargs
-            testargs = {arg: funcargs[arg]
-                        for arg in pyfuncitem._fixtureinfo.argnames}
-
-            event_loop.run_until_complete(
-                asyncio.ensure_future(
-                    pyfuncitem.obj(**testargs), loop=event_loop))
+            if marker_name == 'asyncio_testrun':
+                pyfuncitems = pyfuncitems_configure()
+                event_loop.run_until_complete(
+                    asyncio.wait(pyfuncitems, loop=event_loop))
+            else:
+                funcargs = pyfuncitem.funcargs
+                testargs = {arg: funcargs[arg]
+                            for arg in pyfuncitem._fixtureinfo.argnames}
+                event_loop.run_until_complete(
+                    asyncio.ensure_future(
+                        pyfuncitem.obj(**testargs), loop=event_loop))
             return True
+
+
+def pyfuncitems_configure():
+    global tasks
+    pyfuncitems = []
+    for task in tasks:
+        funcargs = task.funcargs
+        testargs = {arg: funcargs[arg]
+                     for arg in task._fixtureinfo.argnames}
+        pyfuncitems.append(task.obj(**testargs))
+    return pyfuncitems
+
+
+@pytest.mark.tryfirst
+def pytest_runtestloop(session):
+    if (session.testsfailed and
+            not session.config.option.continue_on_collection_errors):
+        raise session.Interrupted(
+            "%d errors during collection" % session.testsfailed)
+
+    if session.config.option.collectonly:
+        return True
+
+    for i, item in enumerate(session.items):
+        if 'asyncio_testrun' in item.keywords:
+            for func in session.items:
+                if 'asyncio_testrun' in func.keywords:
+                    session.items.remove(func)
+            nextitem = session.items[i] if i < len(session.items) else None
+        else:
+            nextitem = session.items[i + 1] if i + 1 < len(session.items) else None
+        item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+        if session.shouldfail:
+            raise session.Failed(session.shouldfail)
+        if session.shouldstop:
+            raise session.Interrupted(session.shouldstop)
+    return True
 
 
 def pytest_runtest_setup(item):
@@ -171,6 +223,7 @@ def pytest_runtest_setup(item):
 _markers_2_fixtures = {
     'asyncio': 'event_loop',
     'asyncio_process_pool': 'event_loop_process_pool',
+    'asyncio_testrun': 'event_loop'
 }
 
 
